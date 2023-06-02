@@ -1554,15 +1554,14 @@ weight of non-holiday weeks.</p>
 <h1>Strategy</h1>
 <p>Our approach was to create more than one model and average the
 predictions over these models; specifically, we created a linear
-regression model based on the code provided by Prof. Liang, as well as a
-boosted trees (XGBoost) model. The combined performance of the two
-models exceeded the performance of either model individually. The theory
-behind this approach was that if we could produce two models whose
-errors were uncorrelated, the average of the two predictions would
-better distinguish the signal from the noise in the data. XGBoost was
-chosen to complement the linear model, as it uses a very different
-approach to prediction and therefore was expected to produce
-uncorrelated errors.</p>
+regression model as well as a boosted trees (XGBoost) model. The
+combined performance of the two models exceeded the performance of
+either model individually. The theory behind this approach was that if
+we could produce two models whose errors were uncorrelated, the average
+of the two predictions would better distinguish the signal from the
+noise in the data. XGBoost was chosen to complement the linear model, as
+it uses a very different approach to prediction and therefore was
+expected to produce uncorrelated errors.</p>
 </div>
 <div id="pre-processing" class="section level1">
 <h1>Pre-Processing</h1>
@@ -1664,13 +1663,10 @@ departments that appeared in both the training and test sets of the
 current fold. Then, within a <code>for</code> loop, we extracted the
 training and test observations for the current store and department. The
 last step before fitting a model was to account for the bulge in sales
-around Christmas in fold 5 of the test set. We accomplished this using
-the “shift trick” described by Prof. Liang on Campuswire. However,
-unlike the implementation posted on Campuswire, we applied the shift to
-weeks 48 through 52. Specifically, for weeks 48 through 51, we decreased
-the Week’s sales by 1/7th, and then added 1/7 of the following week’s
-sales. Then for week 52, we just decreased the week’s sales by
-1/7th.</p>
+around Christmas in fold 5 of the test set. We accomplished this by
+shifting weeks 48 through 51, decreasing the Week’s sales by 1/7th, and
+then adding 1/7 of the following week’s sales. Then for week 52, we just
+decreased the week’s sales by 1/7th.</p>
 <p>After shifting the data, we ran basic linear regression (using
 <code>lm.fit</code>) on the training set for the batch of observations
 associated with the current store and department. So the dataset used
