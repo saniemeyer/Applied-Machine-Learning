@@ -1,0 +1,1711 @@
+---
+title: "A MLR-Based Customer Value Prediction Model for a Time-Constrained Dataset"
+date: "Summer 2022"
+output:
+  html_document: 
+    theme: readable
+    toc: yes
+  pdf_document: default
+urlcolor: cyan
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE}
+options(scipen = 999, digits = 4, width = 80, fig.align = "center")
+```
+
+# Introduction
+
+The ability to predict a retail customer's long-term value is critical for effective customer relationship management (CRM). One of the challenges of a CRM strategy is to determine whether a new customer will develop into a valuable long-term customer. The difficulty in this prediction lies in the fact that new customers, by definition, have a limited shopping history. So there is limited data, a limited signal, from which to predict the response. However, the sooner a customer's value can be predicted, the more effective marketing campaigns will be in retaining these customers and ensuring that they return for future visits. The goal of this paper is to determine if one-month of shopping history, in combination with a selection of the customer's personal attributes (gender, age, income, psychographic profile, etc.) is sufficient to predict, with a useful degree of accuracy, the customer's subsequent three-year value. We will therefore be modeling for prediction rather than inference. 
+
+## I. Dataset
+
+The data for this analysis is the set of customers who shopped at a newly-opened location of a midwest-based big-box retailer during the first month of the store's opening. There are 13,332 records, with one record per customer. The shopping history of these customers was recorded for the one-month period after the store's opening. This data, along with the customer's personal attributes, will serve as the predictors for our model. The response is `Three_Year_Spend` - the customer's total spend, in dollars, over the subsequent three years (i.e. the three years *following* the initial one-month shopping period). 
+
+The data set was extracted to a comma-delimited file from the company's data warehouse, which synthesizes information about the customer from multiple sources, including commercially available consumer databases. The personal attributes of each customer were obtained from these consumer databases. The file contains 31 predictors, 11 categorical and 20 numeric. A complete description of each variable is provided in the data dictionary below.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(readr)
+library(knitr)
+
+dic = read_csv("Dictionary.csv")
+
+kable(dic, caption = "Data Dictionary for Customer Data File")
+```
+
+# Methods
+
+The following `R` libraries were utilized for this analysis:
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(boot)
+library(car)
+library(readr)
+library(knitr)
+library(leaps)
+library(forecast)
+library(faraway)
+library(Hmisc)
+library(corrplot)
+library(matrixStats)
+library(lmtest)
+library(MASS)
+library(caret)
+```
+
+The following general functions are used throughout the analysis:
+
+```{r}
+##### Calculate LOOCV RMSE
+
+get_bp_decision = function(model, alpha) {
+  decide = unname(bptest(model)$p.value < alpha)
+  ifelse(decide, "Reject", "Fail to Reject")
+}
+
+get_sw_decision = function(model, alpha) {
+  decide = unname(shapiro.test(resid(model))$p.value < alpha)
+  ifelse(decide, "Reject", "Fail to Reject")
+}
+
+get_num_params = function(model) {
+  length(coef(model))
+}
+
+get_loocv_rmse = function(model) {
+  x = (resid(model) / (1 - hatvalues(model))) ^ 2
+  sqrt(mean(x[is.finite(x)]))
+}
+
+get_rmse = function(resid) {
+  sqrt(mean(resid^2))
+}
+
+get_r2 = function (actuals, predictions) {
+    cor(actuals, predictions) ^ 2
+}
+
+get_adj_r2 = function(model) {
+  summary(model)$adj.r.squared
+}
+
+```
+
+
+## I. Data Preparation
+
+```{r}
+# load the data file
+df = read.csv('Customers.csv')
+```
+
+### A. Remove unused predictors
+
+After loading the dataset, we remove the variables `Customer_ID` and `Home_Value`. 
+
+`Customer_ID` was removed because it is simply a unique identifier for each customer and has no relationship to any other variables of interest. 
+
+`Home_Value` was removed because it is almost perfectly correlated with the variable `Est_Income` and is not populated for any records for which `Est_Income` is not populated: 
+
+```{r}
+# display correlation matrix for Est_Income and Home_Value
+cor(df[!is.na(df$Est_Income) & !is.na(df$Home_Value), c("Est_Income","Home_Value")])
+```
+
+Additionally, the variance inflation factors for both `Est_Income` and `Home_Value` indicate extremely high collinearity on the variance of our regression estimates:
+
+```{r}
+faraway::vif(lm(Three_Year_Spend ~ Est_Income + Home_Value, data = df))
+```
+Another candidate for removal is `Seg_Type`. This categorical predictor has `r length(unique(df$Seg_Type))` distinct values. Using this predictor would substantially increase the size of our model. Given that we know `Seg_Group` was developed as a higher-level classification scheme for `Seg_Type`, we wanted to determine if this predictor could substitute for the `Seg_Type` predictor. Some quick tests indicate that although `Seg_Type` is slightly more predictive than `Seg_Group`, and an ANOVA test indicates a statistically significant impact on the response, the difference in LOOCV-RMSE to be gained by using `Seg_Type` is extremely small. Removing this predictor substantially reduces the size of our model with little effect on predictivity. 
+
+```{r}
+null_mod = lm(Three_Year_Spend ~ Seg_Group + Num_Trans, data = df)
+seg_type_mod = lm(Three_Year_Spend ~ Seg_Type + Seg_Group + Num_Trans, data = df)
+
+paste("ANOVA p-value: ", anova(null_mod, seg_type_mod)[2, "Pr(>F)"], sep="", collapse="")
+
+model_comparison = data.frame(Model = c("Seg_Group Only", "Seg_Type + Seg_Group"),
+                              RMSE = c(get_loocv_rmse(null_mod), get_loocv_rmse(seg_type_mod)),
+                              R2 = c(get_adj_r2(null_mod), get_adj_r2(seg_type_mod)),
+                              AIC = c(extractAIC(null_mod)[2], extractAIC(seg_type_mod)[2]),
+                              Num_Params = c(get_num_params(null_mod), get_num_params(seg_type_mod)))
+kable(model_comparison, col.names = c("Model", "LOOCV-RMSE", "R-Squared", "AIC", "# Parameters"), caption = "Comparison of Seg_Group Model vs. Seg_Group + Seg_Type Model")
+
+# So we remove the Customer_ID, Home_Value, and Seg_Type predictors
+df = subset(df, select = -c(Customer_ID, Home_Value, Seg_Type))
+```
+
+### B. Pre-process Categorical Predictors
+
+In addition to the `Seg_Type` predictor that we just removed, our dataset has several multi-class categorical predictors that can cause problems for imputation and cross-validation. When performing cross-validation, if the test dataset and the training dataset have different levels of the same factor, regression will fail. This is also a problem when attempting to impute missing values via logistic or linear regression, because the `predict` function expects the dataset for the data being predicted to use the same levels of each factor as the dataset used to train the imputation model. This issue can be addressed by using dummy variables instead of factors. 
+
+So we will convert these multi-class categorical predictors to sets of dummy variables, and then remove the original predictors.
+
+Starting with `Seg_Group`, we will translate the `F` class into the `U` ("Unknown") class, as there are only `r sum(df$Seg_Group == "F")` observations with the `F` class, and then create dummy variables for the remaining classes, using `U` as our reference level. 
+
+```{r}
+df$Seg_Group = ifelse(df$Seg_Group == "F", "U", df$Seg_Group)
+df$Seg_Group_A = 1 * as.numeric(df$Seg_Group == "A")
+df$Seg_Group_B = 1 * as.numeric(df$Seg_Group == "B")
+df$Seg_Group_C = 1 * as.numeric(df$Seg_Group == "C")
+df$Seg_Group_D = 1 * as.numeric(df$Seg_Group == "D")
+df$Seg_Group_E = 1 * as.numeric(df$Seg_Group == "E")
+df$Seg_Group_G = 1 * as.numeric(df$Seg_Group == "G")
+```
+
+`Occupation` is another multi-class categorical predictor that needs to be condensed. It has `r length(unique(df$Occupation))` classes, several of which correspond to only a few observations. The standard techniques for dimensionality reduction were not covered in the course, so we will take an approach that uses iterative regression to identify the set of Occupations that minimize both RMSE and the size of the model. We first compute the count of each Occupation class and then find its $\beta$-coefficient from a linear regression model. Each Occupation is then weighted by its number of observations and the magnitude of its coefficient. We iteratively create larger sets of Occupations, starting with those of the largest weight and proceeding to those with the smallest weight. At each iteration, we compute the LOOCV-RMSE and $R^2$ that result from only using this set of Occupations. Finally, we plot the relationship between the number of Occupations used in the model and the resulting LOOCV-RMSE and $R^2$.
+
+```{r fig.height=5, fig.width=10}
+df_occ = data.frame(df)
+
+df_occ$Occupation = ifelse(df_occ$Occupation == "", "Other", df_occ$Occupation)
+
+occ_counts = as.vector(table(df_occ$Occupation))
+
+occ_mod = lm(Three_Year_Spend ~ Occupation, data = df_occ)
+
+occ_coefs = as.vector(coef(occ_mod))
+
+occ_names = sort(unique(df_occ$Occupation))
+
+occ_type_stats = data.frame(Occupation = occ_names, 
+                            Counts = occ_counts, 
+                            Coefs = occ_coefs, 
+                            Weight = abs(occ_counts * occ_coefs))
+
+occ_type_stats = occ_type_stats[order(-occ_type_stats$Weight), ]
+
+fit_stats = data.frame(Num_Occupations = rep(0, nrow(occ_type_stats)), 
+                       RMSE = rep(0, nrow(occ_type_stats)), 
+                       R2 = rep(0, nrow(occ_type_stats)))
+
+for (i in 1:nrow(occ_type_stats)) {
+    df_occ = data.frame(df)
+    selected_occs = occ_type_stats[1:i, "Occupation"] 
+   
+    # condense Occupations to only the selected Occupations, 
+    # replacing the non-selected Occupations with "Other"
+    df_occ$Occupation = ifelse(df_occ$Occupation %in% selected_occs, 
+                               df_occ$Occupation, "Other")
+    
+    # train a model using these condensed Occupations
+    mod = lm(Three_Year_Spend ~ Occupation, data = df_occ)
+    
+    # store the results in a data.frame
+    fit_stats[i, "R2"] = get_adj_r2(mod)
+    fit_stats[i, "RMSE"] = get_loocv_rmse(mod)
+    fit_stats[i, "Num_Occupations"] = i
+}
+
+# plot the RMSE and R2 against the number of occupations used in the model
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+plot(RMSE ~ Num_Occupations, 
+     data = fit_stats, 
+     type = "o", 
+     xlab = "Number of Occupations", 
+     ylab = "LOOCV-RMSE", 
+     col="dodgerblue") 
+axis(1, at=fit_stats$Num_Occupations, labels=fit_stats$Num_Occupations)
+abline(v = 10, col="darkorange", lwd = 2)
+
+plot(R2 ~ Num_Occupations, 
+     data = fit_stats, 
+     type = "o", 
+     xlab = "Number of Occupations", 
+     ylab = "R-Squared", 
+     col="dodgerblue")
+axis(1, at=fit_stats$Num_Occupations, labels=fit_stats$Num_Occupations)
+abline(v = 10, col="darkorange", lwd = 2)
+
+mtext("RMSE and R-Squared as a function of the Number of Occupations used in Model", outer = TRUE)
+
+```
+It appears that 10 Occupations essentially minimize LOOCV-RMSE and maximize $R^2$. Adding additional Occupations either increases RMSE or obtains very small improvements. However, what is also apparent is that Occupation, by itself, has a very small impact on the model, and should likely be excluded altogether. We will retain it for now and translate these 10 Occupations into dummy variables.
+
+The 10 selected Occupations were:
+
+```{r}
+
+kable(head(data.frame(Occupation = occ_type_stats$Occupation, 
+           Obs = occ_type_stats$Counts, 
+           Coef = occ_type_stats$Coefs, 
+           Weights = occ_type_stats$Weight),10), 
+      col.names = c("Occupation", 
+                    "Num Observations", 
+                    "Beta-Coefficient", 
+                    "Weighted Value"),
+      caption = "Selected Occupations")
+```
+
+
+```{r}
+df$Occupation = ifelse(df$Occupation %in% occ_type_stats[1:10, "Occupation"], 
+                      df$Occupation, "Other")
+
+df$Occupation_Retired = 1 * as.numeric(df$Occupation == "Retired") 
+df$Occupation_Sales = 1 * as.numeric(df$Occupation == "Sales") 
+df$Occupation_Professional =1 * as.numeric(df$Occupation == "Professional") 
+df$Occupation_Management = 1 * as.numeric(df$Occupation == "Management") 
+df$Occupation_BlueCollar = 1 * as.numeric(df$Occupation == "Blue Collar") 
+df$Occupation_OfficeAdmin = 1 * as.numeric(df$Occupation == "Office Administration") 
+df$Occupation_Technical = 1 * as.numeric(df$Occupation == "Technical") 
+df$Occupation_SelfEmployed = 1 * as.numeric(df$Occupation == "Self Employed") 
+df$Occupation_Farmer = 1 * as.numeric(df$Occupation == "Farmer") 
+```
+
+We will next consider the multi-class categorical predictor `Education`. This predictor has only five classes, so it does not need to be condensed.
+
+```{r}
+df$Education_HS = 1 * as.numeric(df$Education == "High School")
+df$Education_SomeCollege = 1 * as.numeric(df$Education == "Some College")
+df$Education_College = 1 * as.numeric(df$Education == "Bachelors Degree")
+df$Education_Graduate = 1 * as.numeric(df$Education == "Graduate Degree")
+```
+
+Finally we have a dichotomous predictor, `Political_Ideology`, that we simply need to translate into zeros and ones (leaving the `NA`s in place, which will be imputed later). 
+
+```{r}
+df$Political_Ideology = ifelse(df$Political_Ideology == "Conservative", 1, 
+                               ifelse(df$Political_Ideology == "Liberal", 0, NA))
+```
+
+We can now remove the original, unconverted predictors:
+
+```{r}
+df = subset(df, select = -c(Seg_Group, Occupation, Education))
+```
+
+### C. Imputation
+
+As can be seen from the data dictionary, many of the predictors are sparsely populated. We therefore would like to impute the missing values for these predictors. Multiple Imputation using the `mice` (Multivariate Imputation by Chained Equations) package is a robust and commonly used technique in `R` which uses stochastic regression to minimize the bias of the estimates. Although we would prefer to use this methodology in the current context, the project specifications limit us to techniques covered in this course. Therefore we will use a less sophisticated approach and simply attempt to impute missing values on the basis of logistic and linear regression. 
+
+As there are twelve predictors with missing values, it is beyond the scope of this project to develop twelve robust and well-designed models for the imputation of each predictor. Developing an imputation model for each predictor could be a project in of itself. Therefore we will use a simple backwards AIC approach, utilizing all other predictors as the starting model, to impute the value of the target predictor. We will begin by imputing values for the predictor with the *largest* proportion of missing values, and iterate through the remaining predictors in the order of their incompleteness. 
+
+Logistic regression will be used to impute the dichotomous variables and multiple linear regression will be used for the numeric variables. 
+
+`Truck_Owner` cannot be modeled as it takes only the values `1` and `NA`, with `NA` meaning "Unknown". So we will simply convert the unknowns to `0`. 
+
+```{r}
+df[is.na(df$Truck_Owner), "Truck_Owner"] = 0
+```
+
+
+For imputing the remaining predictors, we must begin with some default values for the predictors that will be used to model the target predictor. For dichotomous predictors, the default value we will be the majority class (as this is the most probable value), and for numeric predictors the default value will be the median (in preference to the mean, since we have not yet removed outliers from the dataset). We might also consider using the mode, but we would like the distributions of our predictors to remain approximately the same, and there is no guarantee that the most frequent value would also be a centrally-distributed value. When we previously converted the multi-class categorical predictors to dummy variables, we essentially replaced the `NA` values with the reference level, so there is no need to impute those predictors here. 
+
+```{r}
+default_imputation = function(df, target) {
+  
+  if (target != "Pet_Owner") {
+    df[is.na(df$Pet_Owner), "Pet_Owner"] = 1
+  } 
+  
+  if (target != "Num_Children") {
+    df[is.na(df$Num_Children), "Num_Children"] = median(df$Num_Children, na.rm = TRUE)
+  }
+  
+  if (target != "Political_Ideology") {
+    df[is.na(df$Political_Ideology), "Political_Ideology"] = 1
+  }
+  
+  if (target != "Num_Adults") {
+    df[is.na(df$Num_Adults), "Num_Adults"] = median(df$Num_Adults, na.rm = TRUE)
+  }
+  
+  if (target != "Married") {
+    df[is.na(df$Married), "Married"] = 1
+  }
+  
+  if (target != "Est_Income") {
+    df[is.na(df$Est_Income), "Est_Income"] = median(df$Est_Income, na.rm = TRUE)
+  }
+  
+  if (target != "Length_of_Residence") {
+    df[is.na(df$Length_of_Residence), "Length_of_Residence"] =     
+      median(df$Length_of_Residence, na.rm = TRUE)
+  }
+  
+  if (target != "Age") {
+    df[is.na(df$Age), "Age"] = median(df$Age, na.rm = TRUE)
+  }
+
+  df
+}
+
+impute_missing_vals = function (data, target, type = "lm") {
+  
+  df_tmp = default_imputation(data, target)
+  target_predictor = df_tmp[ , target]
+  
+  # create one data.frame for records missing the target predictor 
+  # and another for records that contain the target predictor
+  df_trn = df_tmp[!is.na(target_predictor), ]
+  df_predict = df_tmp[is.na(target_predictor), ]
+  
+  # use formula syntax to specify the regression model
+  formula = paste(target, "~ . -Three_Year_Spend", collapse = "")
+  
+  if (type == "lm") {
+    mod = lm(formula = formula, data = df_trn)
+    step_mod = step(mod, trace = FALSE)
+    predictions = predict(mod, newdata = df_predict)
+  } 
+  else {
+    mod = glm(formula = formula, data = df_trn, family = binomial)
+    step_mod = step(mod, trace = FALSE)
+    # classify based upon highest probability
+    predictions = ifelse(predict(mod, newdata = df_predict, type = "response") > 0.5, 1, 0)
+  }
+  
+  predictions
+}
+
+get_pre_post_imputation_stats = function(pre_df, post_df) {
+
+  imputed_cols = colnames(pre_df)
+  
+  n = length(imputed_cols)
+  
+  df_stats = data.frame(Predictor = rep("", n),
+                        PreMean = rep(0, n),
+                        PostMean = rep(0, n),
+                        PreMedian = rep(0, n),
+                        PostMedian = rep(0, n),
+                        PreIQR = rep(0, n),
+                        PostIQR = rep(0, n),
+                        PreNAs = rep(0, n),
+                        PostNAs = rep(0, n))
+  for (i in 1:n) {
+    
+    target = imputed_cols[i]
+    
+    df_stats[i, "Predictor"] = target
+    
+    df_stats[i, "PreMean"] = round(mean(pre_df[ , target], na.rm = TRUE), 2)
+    df_stats[i, "PreMedian"] = round(median(pre_df[ , target], na.rm = TRUE), 0)
+    df_stats[i, "PreIQR"] = round(IQR(pre_df[ , target], na.rm = TRUE), 0)
+    df_stats[i, "PreNAs"] = round(sum(is.na(pre_df[ , target])), 0)
+    
+    df_stats[i, "PostMean"] = round(mean(post_df[ , target], na.rm = TRUE), 2)
+    df_stats[i, "PostMedian"] = round(median(post_df[ , target], na.rm = TRUE), 0)
+    df_stats[i, "PostIQR"] = round(IQR(post_df[ , target], na.rm = TRUE), 0)
+    df_stats[i, "PostNAs"] = round(sum(is.na(post_df[ , target])), 0)
+  }
+  
+  df_stats
+}
+```
+
+The predictor `Num_Children` is the most sparsely populated predictor after `Truck_Owner`, with `r format(sum(is.na(df$Num_Children)), scientific = FALSE, big.mark = ",")` records, so we will impute its values first, using multiple linear regression. Then we will proceed with the remaining predictors that contain observations with missing values, in the order of most missing values to fewest missing values.
+
+```{r message=FALSE, warning=FALSE}
+# store the state of our data.frame before any imputation
+df_pre_imputation = data.frame(df)
+
+# Impute the missing values of Num_Chidren, 
+# specifying linear regression (lm) as the imputation methodology
+predictions = impute_missing_vals(data = df, 
+                                  target = "Num_Children", 
+                                  type = "lm")
+# if the prediction is negative, convert to 0, as we can't have negative children.
+df[is.na(df$Num_Children), "Num_Children"] = ifelse(predictions < 0, 0, 
+                                                    round(predictions,0))
+
+# Impute the missing values of Political_Ideology, 
+# specifying logistic regression as the imputation methodology
+predictions = impute_missing_vals(data = df, 
+                                  target = "Political_Ideology", 
+                                  type = "glm")
+df[is.na(df$Political_Ideology), "Political_Ideology"] = predictions
+
+# Impute the missing values of Pet_Owner, specifying logistic regression as the imputation methodology
+predictions = impute_missing_vals(data = df, 
+                                  target = "Pet_Owner", 
+                                  type = "glm")
+df[is.na(df$Pet_Owner), "Pet_Owner"] = predictions
+
+# Impute the missing values of Num_Adults, 
+# specifying linear regression (lm) as the imputation methodology
+# Num_Adults cannot be less than zero, so translate any negatives to zeros
+predictions = impute_missing_vals(data = df, 
+                                  target = "Num_Adults", 
+                                  type = "lm")
+df[is.na(df$Num_Adults), "Num_Adults"] = ifelse(predictions < 0, 0, 
+                                                round(predictions,0))
+
+# Impute the missing values of Married, 
+# specifying logistic regression as the imputation methodology
+predictions = impute_missing_vals(data = df, 
+                                  target = "Married", 
+                                  type = "glm")
+df[is.na(df$Married), "Married"] = predictions
+
+# Impute the missing values of Est_Income,
+# specifying linear regression (lm) as the imputation methodology
+# Est_Income cannot be less than zero, so translate any negatives to zeros
+predictions = impute_missing_vals(data = df, 
+                                  target = "Est_Income", 
+                                  type = "lm")
+df[is.na(df$Est_Income), "Est_Income"] = ifelse(predictions < 0, 0, 
+                                                round(predictions,0))
+
+# Impute the missing values of Length_of_Residence, 
+# specifying linear regression (lm) as the imputation methodology
+# Length_of_Residence cannot be less than zero, so translate any negatives to zeros
+predictions = impute_missing_vals(data = df, 
+                                  target = "Length_of_Residence", 
+                                  type = "lm")
+df[is.na(df$Length_of_Residence), "Length_of_Residence"] = ifelse(predictions < 0, 0, 
+                                                                  round(predictions,0))
+
+# Impute the missing values of Age, 
+# specifying linear regression (lm) as the imputation methodology
+# Age cannot be less than zero, so translate any negatives to zeros
+predictions = impute_missing_vals(data = df, 
+                                  target = "Age", 
+                                  type = "lm")
+df[is.na(df$Age), "Age"] = ifelse(predictions < 0, 0, 
+                                  round(predictions,0))
+```
+
+Let's now check the distributions of our data.frame before and after imputation. 
+
+```{r}
+
+df_post_imputation_numeric = df[ , c("Num_Children", 
+                                     "Num_Adults", 
+                                     "Est_Income", 
+                                     "Length_of_Residence", 
+                                     "Age")]
+
+df_pre_imputation_numeric = df_pre_imputation[ , c("Num_Children", 
+                                                   "Num_Adults", 
+                                                   "Est_Income", 
+                                                   "Length_of_Residence", 
+                                                   "Age")]
+
+hist.data.frame(df_pre_imputation_numeric, 
+                mtitl = "Pre-Imputation Distributions for Numeric Predictors")
+
+hist.data.frame(df_post_imputation_numeric, 
+                mtitl = "Post-Imputation Distributions for Numeric Predictors")
+
+imputation_stats = get_pre_post_imputation_stats(df_pre_imputation_numeric, df_post_imputation_numeric)
+
+kable(imputation_stats, col.names = c("Predictor", 
+                                      "Pre-Mean", 
+                                      "Post-Mean", 
+                                      "Pre-Median", 
+                                      "Post-Median", 
+                                      "Pre-IQR", 
+                                      "Post-IQR", 
+                                      "Pre-NAs", 
+                                      "Post-NAs"), 
+      caption = "Pre- and Post-Imputation Comparison of Distributions for Numeric Predictors")
+
+imputation_stats2 = data.frame(Predictor = c("Political Ideology", "Pet_Owner", "Married"),
+                               Pre = c(table(df_pre_imputation$Political_Ideology)[2] /
+                                         sum(table(df_pre_imputation$Political_Ideology)),
+                                       table(df_pre_imputation$Pet_Owner)[2] / 
+                                         sum(table(df_pre_imputation$Pet_Owner)),
+                                       table(df_pre_imputation$Married)[2] / 
+                                         sum(table(df_pre_imputation$Married))),
+                               Post = c(table(df$Political_Ideology)[2] / nrow(df),
+                                        table(df$Pet_Owner)[2] / nrow(df),
+                                        table(df$Married)[2] / nrow(df)),
+                               PreNAs = c(sum(is.na(df_pre_imputation$Political_Ideology)),
+                                          sum(is.na(df_pre_imputation$Pet_Owner)),
+                                          sum(is.na(df_pre_imputation$Married))),
+                               PostNAs = c(sum(is.na(df$Political_Ideology)),
+                                          sum(is.na(df$Pet_Owner)),
+                                          sum(is.na(df$Married))))
+
+kable(imputation_stats2, col.names = c("Predictor", 
+                                       "Pre-Proportion", 
+                                       "Post-Proportion", 
+                                       "Pre-NAs", 
+                                       "Post-NAs"), 
+      caption = "Pre- and Post-Imputation Comparison of Majority Class Proportions for Dichotomous Predictors")
+
+
+```
+
+These results are satisfactory. Our imputation has replaced all of the `NA` values, but the distributions of the predictors have hardly changed.
+
+## II. Exploratory Data Analysis and Additional Data Preparation
+
+Now that the dataset is fully populated, we can explore the predictors at our disposal and determine whether they need to be modified in any way.
+
+### A. Correlation Matrix
+
+We first examine the correlation coefficients between each of the variables in our dataset:
+
+```{r fig.height=12, fig.width=12}
+corrplot(cor(df), method="circle")
+```
+
+It is immediately obvious that none of the predictors, on their own, have a particularly strong relationship to the response. The personal attributes of the customer, in particular, are much less predictive than expected. For instance, we believed that a customer's distance from the store would be highly predictive of their future spending behavior, but the correlation plot shows practically no relationship between this predictor and the response. 
+
+The most predictive variables are the ones most similar to the response: `Num_Trans` at `r round(cor(df$Three_Year_Spend, df$Num_Trans),2)` and `Total_Spend` at `r round(cor(df$Three_Year_Spend, df$Total_Spend),2)`, the customer's total number of transactions and spend (in dollars) in the first month after opening. 
+
+As expected, there are strong relationships between the each of the components of a customer's spend (e.g. between `Total_Spend` and `Division_Hardware_Spend`), so we will need to be aware of potential collinearity in the model if we use more than one of these predictors.
+
+Now, looking specifically at each predictor's ability to predict the response, we see that, apart from `Seg_Group_A`, all of the top ten predictors are those that are based upon customer behavior; specifically, the customer's one-month shopping behavior or the customer's decision to sign up for the loyalty program. Apart from `Num_Trans` and `Total_Spend`, none of the predictors, on their own, account for more than 10% of the variance in the response. 
+
+```{r}
+set.seed(5)
+predictors = colnames(df)[-1]
+train_ind = createDataPartition(df$Three_Year_Spend, p = .75, list = FALSE)
+df_train = df[train_ind, ]
+df_test = df[-train_ind, ]
+mod_stats = data.frame(Predictor = predictors, 
+                       loocv = rep(0, length(predictors)), 
+                       R2 = rep(0, length(predictors)),
+                       p_val = rep(0, length(predictors)))
+
+mod = lm(Three_Year_Spend ~ Num_Trans, data = df_test)
+
+for (i in 1:length(predictors)) {
+    formula = paste("Three_Year_Spend ~", predictors[i], collapse = "")
+    mod = lm(formula = formula, data = df_train)
+    mod_stats[i, "Predictor"] = predictors[i]
+    mod_stats[i, "loocv"] = get_loocv_rmse(mod)
+    mod_stats[i, "R2"] = get_r2(df_test$Three_Year_Spend, 
+                                predict(mod, newdata = df_test))
+    mod_stats[i, "p_val"] = format(summary(mod)$coefficients[2, "Pr(>|t|)"], 
+                                   scientific = TRUE, big.mark = ",")
+}
+mod_stats = mod_stats[order(mod_stats$loocv), ]
+kable(head(data.frame(Predictor = mod_stats$Predictor,
+                      loocv = mod_stats$loocv,
+                      R2 = mod_stats$R2,
+                      p_val = mod_stats$p_val),
+            10), 
+      col.names = c("Predictor", "LOOCV-RMSE", "Test R-Squared", "Sig. of Regression p-val"),
+      align=c("l","c","c","c"))
+```
+
+
+Given that none of the predictors are strongly associated with the response, the model will need to rely upon transformations, interactions, or other modifications in order to achieve a useful level of predictive value. In other words, this model is not likely to be useful unless we can substantially improve its ability to predict the response. Therefore, we will probably need to make some trade-offs in the construction of the model, trading simplicity and interpretability for any increase in predictivity that we can squeeze from the data.  
+
+### B. Distribution of Predictors
+
+We will now look at the range of values for each predictor, checking to see whether any extreme values stand out. 
+
+```{r}
+df_numeric = df[ , c("Distance", "Age", "Length_of_Residence",
+                     "Num_Adults", "Num_Children", "Est_Income",
+                     "Total_Spend", "Num_Trans", "Num_Items", "Num_Depts",
+                     "Division_Ag_Spend", "Division_Pet_Spend", 
+                     "Division_Auto_Spend", "Division_Hardware_Spend", 
+                     "Division_Home_Spend", "Division_Seasonal_Spend",
+                     "Division_Clothing_Spend", "Division_SportingGoods_Spend", 
+                     "Division_FoodBev_Spend")]
+
+ranges = data.frame(Predictor = colnames(df_numeric), 
+                    Min = format(round(colRanges(as.matrix(df_numeric))[, 1],0), 
+                                   scientific = FALSE, big.mark = ","), 
+                    Max = format(round(colRanges(as.matrix(df_numeric))[, 2],0), 
+                                   scientific = FALSE, big.mark = ","),
+                    SD = format(round(colSds(as.matrix(df_numeric)),0), 
+                                   scientific = FALSE, big.mark = ","))
+
+kable(ranges, col.names = c("Predictor","Min Value", "Max Value", "Std Dev"), 
+      caption = "Value Ranges for Numeric Predictors",
+      align = c("l","r","r","r"))
+```
+Some of the predictors relating to customer spend have negative or zero values. The negatives indicate that the customer returned more merchandise in the period than they purchased. We can convert these values to zeros, as we don't care to distinguish between a slightly negative spend and a zero-dollar spend. Additionally, because many statistical techniques (such as Box-Cox) assume a positive distribution, we will convert all zeros to a tiny positive number: 0.0001.
+
+```{r}
+df$Three_Year_Spend = ifelse(df$Three_Year_Spend <= 0, 0.0001, 
+                             df$Three_Year_Spend)
+
+df$Length_of_Residence = ifelse(df$Length_of_Residence <= 0, 0.0001, 
+                                df$Length_of_Residence)
+
+df$Num_Children = ifelse(df$Num_Children <= 0, 0.0001, 
+                         df$Num_Children)
+
+df$Total_Spend = ifelse(df$Total_Spend <= 0, 0.0001, 
+                        df$Total_Spend)
+
+df$Num_Items = ifelse(df$Num_Items <= 0, 0.0001, 
+                      df$Num_Items)
+
+df$Division_Ag_Spend = ifelse(df$Division_Ag_Spend <= 0, 0.0001, 
+                              df$Division_Ag_Spend)
+
+df$Division_Pet_Spend = ifelse(df$Division_Pet_Spend <= 0, 0.0001, 
+                               df$Division_Pet_Spend)
+
+df$Division_Auto_Spend = ifelse(df$Division_Auto_Spend <= 0, 0.0001, 
+                                df$Division_Auto_Spend)
+
+df$Division_Hardware_Spend = ifelse(df$Division_Hardware_Spend <= 0, 0.0001, 
+                                    df$Division_Hardware_Spend)
+
+df$Division_Home_Spend = ifelse(df$Division_Home_Spend <= 0, 0.0001, 
+                                df$Division_Home_Spend)
+
+df$Division_Seasonal_Spend = ifelse(df$Division_Seasonal_Spend <= 0, 0.0001, 
+                                    df$Division_Seasonal_Spend)
+
+df$Division_Clothing_Spend = ifelse(df$Division_Clothing_Spend <= 0, 0.0001, 
+                                    df$Division_Clothing_Spend)
+
+df$Division_SportingGoods_Spend = ifelse(df$Division_SportingGoods_Spend <= 0, 0.0001, 
+                                         df$Division_SportingGoods_Spend)
+
+df$Division_FoodBev_Spend = ifelse(df$Division_FoodBev_Spend <= 0, 0.0001, 
+                                   df$Division_FoodBev_Spend)
+```
+
+
+`Distance` looks like it could be a problem. Looking more closely, we see that there are some very extreme values that are skewing the distribution:
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+
+boxplot(df$Distance, 
+        border="dodgerblue",
+        main = "", 
+        ylab = "Distance from Store (in miles)")
+
+hist(df$Distance, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "", 
+     xlab = "Distance from Store (in miles)")
+
+mtext("Distribution of Distance", outer = TRUE, cex=1.25)
+```
+
+It is unreasonable to think that a customer living 200 miles from the store is going to be spend significantly more or less than a customer living 500 miles from the store; both are extremely unlikely to visit on a regular basis. So this predictor is a candidate for Winsorization. In other words, we can define a ceiling for the upper-bound of this predictor and convert all distances above this ceiling to the value of the ceiling. To determine what a reasonable ceiling for `Distance` should be, we can fit a simple model, using only the predictors `Distance`, `Num_Trans`, and the interaction between these two, and find the maximum distance that minimizes LOOCV-RMSE. 
+
+```{r}
+distance_grid = seq(10, 300, by = 5)
+
+distance_stats = data.frame(Threshold = rep(0, length(distance_grid)), 
+                            RMSE = rep(0, length(distance_grid)))
+
+for (i in 1:length(distance_grid)) {
+  threshold = distance_grid[i]
+  
+  df_dist = df[ , c("Three_Year_Spend", 
+                    "Distance", 
+                    "Num_Trans")]
+  
+  df_dist$Distance = ifelse(df_dist$Distance > threshold, 
+                            threshold, 
+                            df_dist$Distance)
+  
+  mod = lm(Three_Year_Spend ~ Distance + Num_Trans + Num_Trans:Distance, 
+           data = df_dist)
+  
+  distance_stats[i, "Threshold"] = threshold
+  distance_stats[i, "RMSE"] = get_loocv_rmse(mod)
+}
+
+distance_threshold = distance_stats[which.min(distance_stats$RMSE), "Threshold"]
+
+plot(RMSE ~ Threshold, 
+     data = distance_stats, type="l", col="dodgerblue", 
+     ylab = "LOOCV-RMSE",
+     xlab = "Distance Ceiling (in miles)",
+     main = "LOOCV-RMSE vs. Distance Ceiling (in miles)")
+abline(v = distance_threshold, col="darkorange", lwd = 2)
+
+legend("topright", 
+       legend = c("Distance Ceiling that Minimizes LOOCV-RMSE"), 
+       lwd=2, 
+       col="darkorange", 
+       cex=0.75)
+```
+
+
+Our model indicates that LOOCV-RMSE would be minimized if we limit `Distance` to $`r distance_threshold`$ miles. So any Distances above $`r distance_threshold`$ will be set to $`r distance_threshold`$:
+
+```{r}
+df$Distance = ifelse(df$Distance > distance_threshold, distance_threshold, df$Distance)
+```
+
+
+The distribution of `Distance` now looks much better, although it is still strongly positively skewed. We will address the non-normality of our predictors later, when we discuss transformations.  
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+
+boxplot(df$Distance, border="dodgerblue", 
+        main = "", 
+        ylab = "Distance from Store (in miles)")
+
+hist(df$Distance, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "", 
+     xlab = "Distance from Store (in miles)")
+
+mtext("Distribution of Distance After Winsorization", outer = TRUE, cex=1.25)
+```
+
+Now let's determine if any other numeric predictors have extreme ranges that we might want to modify. `Est_Income` also looks like it could be a problem, with a range of `r format(range(df$Est_Income)[1], scientific = FALSE, big.mark = ",")` to `r format(range(df$Est_Income)[2], scientific = FALSE, big.mark = ",")`.
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+boxplot(df$Est_Income, 
+        border="dodgerblue", 
+        main = "", 
+        ylab = "Estimated Household Income")
+
+hist(df$Est_Income, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "", 
+     xlab = "Estimated Household Income")
+
+mtext("Distribution of Est_Income", outer = TRUE, cex=1.25)
+```
+
+We will use the same approach that we used for `Distance` and determine if there is a maximum value for `Est_Income` that improves the RMSE of a model based upon this predictor and `Num_Trans`.
+
+```{r}
+
+income_grid = seq(0, 1000000, by = 10000)
+
+income_stats = data.frame(Threshold = rep(0, length(income_grid)), 
+                          RMSE = rep(0, length(income_grid)))
+
+for (i in 1:length(income_grid)) {
+  threshold = income_grid[i]
+  
+  df_dist = df[ , c("Three_Year_Spend", 
+                    "Est_Income", 
+                    "Num_Trans")]
+  
+  df_dist$Est_Income = ifelse(df_dist$Est_Income > threshold, 
+                              threshold, df_dist$Est_Income)
+  
+  mod = lm(Three_Year_Spend ~ Est_Income + Num_Trans + Num_Trans:Est_Income, 
+           data = df_dist)
+  
+  income_stats[i, "Threshold"] = threshold
+  income_stats[i, "RMSE"] = get_loocv_rmse(mod)
+}
+
+income_threshold = income_stats[which.min(income_stats$RMSE), "Threshold"]
+
+plot(RMSE ~ Threshold, 
+     data = income_stats, type="l", col="dodgerblue", 
+     ylab = "LOOCV-RMSE",
+     xlab = "Income Ceiling",
+     main = "LOOCV-RMSE vs. Income Ceiling")
+abline(v = income_threshold, col="darkorange", lwd = 2)
+legend("topright", legend = c("Income Ceiling that Minimizes LOOCV-RMSE"), 
+       lwd=2, 
+       col="darkorange", 
+       cex=0.75)
+```
+
+The Income Ceiling that Minimizes RMSE is $`r format(income_threshold, scientific = FALSE, big.mark = ",")`.
+
+Our model indicates that LOOCV-RMSE would be minimized if we cap `Est_Income` at $`r format(income_threshold, scientific = FALSE, big.mark = ",")`$, so we will modify the dataset to use this threshold:
+
+```{r}
+df$Est_Income = ifelse(df$Est_Income > income_threshold, income_threshold, df$Est_Income)
+```
+
+The distribution now looks much better:
+
+```{r}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+boxplot(df$Est_Income, 
+        border="dodgerblue", 
+        main = "", 
+        ylab = "Estimated Household Income")
+
+hist(df$Est_Income, breaks = 20, 
+     border="dodgerblue", 
+     col = "darkorange",
+     main = "", 
+     xlab = "Estimated Household Income")
+
+mtext("Distribution of Est_Income After Winsorization", outer = TRUE, cex=1.25)
+```
+
+The ranges of the other predictors look reasonable, so we can move on to address the distribution of the response. 
+
+### C. Distribution of Response
+
+The response has a positive skewed distribution, like many of the other variables in our dataset. It has a very long tail with several extreme values that are not likely to help our model. 
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+boxplot(df$Three_Year_Spend, 
+        border="dodgerblue", 
+        main = "", 
+        ylab = "Three_Year_Spend")
+
+hist(df$Three_Year_Spend, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "", 
+     xlab = "Three_Year_Spend")
+
+mtext("Distribution of Three_Year_Spend", outer = TRUE, cex=1.25)
+```
+
+```{r}
+mod = lm(Three_Year_Spend ~ ., data = df)
+influentials = df[cooks.distance(mod) > (4 / length(cooks.distance(mod))), "Three_Year_Spend"]
+```
+
+
+If we define a default model using all predictors and calculate Cook's Distance, we find `r length(influentials)` influential observations. If we plot the `Three_Year_Spend` of these influential observations, we find that `r round(mean(influentials > 5000)*100,1)`% have a `Three_Year_Spend` above $5,000, which we can see from our graphs above is at the extreme end of the range. From a practical perspective, we are much less concerned with identifying extremely high-spending customers than we are with simply identifying better-than-average customers. The purpose of this model is simply to generate a subset of customers who can be targeted by marketing campaigns, not to identify the elite set of super-spenders. Therefore it makes sense, in this context to also Winsorize `Three_Year_Spend`, so that the model focuses on predicting above-average customers rather than attempting to capture all of the variability introduced by the outlying spenders. 
+
+```{r fig.height=5, fig.width=10}
+hist(influentials, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "Frequency of Three_Year_Spend for Influential Observations")
+```
+
+ 
+We will attempt to find a reasonable ceiling for `Three_Year_Spend` using the same methodology we used for `Distance` and `Est_Income`:
+ 
+```{r}
+spend_grid = seq(0, 35000, by = 500)
+
+spend_stats = data.frame(Threshold = rep(0, length(spend_grid)), 
+                         RMSE = rep(0, length(spend_grid)))
+
+for (i in 1:length(spend_grid)) {
+  threshold = spend_grid[i]
+  
+  df_dist = data.frame(df)
+  
+  df_dist$Three_Year_Spend = ifelse(df_dist$Three_Year_Spend > threshold, 
+                                    threshold, df_dist$Three_Year_Spend)
+  
+  mod = lm(Three_Year_Spend ~ ., data = df_dist)
+  
+  spend_stats[i, "Threshold"] = threshold
+  spend_stats[i, "RMSE"] = get_loocv_rmse(mod)
+}
+
+spend_threshold = spend_stats[which.min(spend_stats$RMSE), "Threshold"]
+
+plot(RMSE ~ Threshold, 
+     data = spend_stats, type="l", col="dodgerblue", 
+     ylab = "LOOCV-RMSE",
+     xlab = "Three_Year_Spend Ceiling",
+     main = "LOOCV-RMSE vs. Three_Year_Spend Ceiling")
+abline(v = 5000, col="darkorange", lwd = 2)
+abline(v = 10000, col="darkorange", lwd = 2)
+```
+
+Based upon this plot, it appears that a good threshold value might be between $5,000 and $10,000. RMSE obviously increases as we increase the threshold, because the range of values that it needs to predict is larger, but setting this threshold at a very low value would make the model useless. Previous research has indicated that a "very good" customer spends around $2,000 per year. We see that RMSE plateaus at around $15,000, but in the range between $5,000 and $10,000 there is still opportunity to significantly reduce our error. Approximately `r round(mean(df$Three_Year_Spend > 5500)*100,1)`% of observations have a `Three_Year_Spend` greater than $5,500. So, based upon all these factors, we will set our `Three_Year_Spend` threshold at $5,500 (approximately $1,800 per year) and treat all customers spending above this level the same. 
+
+```{r}
+df$Three_Year_Spend = ifelse(df$Three_Year_Spend > 5500, 5500, df$Three_Year_Spend)
+```
+
+
+After Winsorizing `Three_Year_Spend`, the distribution is still strongly skewed, which we will need to address with further transformations to be discussed later, but we have at least reduced the influence of the most extreme values.
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+
+boxplot(df$Three_Year_Spend, 
+        border="dodgerblue", 
+        main = "", 
+        ylab = "Three_Year_Spend")
+
+hist(df$Three_Year_Spend, breaks = 20, 
+     border="dodgerblue", 
+     col="darkorange", 
+     main = "", 
+     xlab = "Three_Year_Spend")
+
+mtext("Distribution of Three_Year_Spend After Winsorization", outer = TRUE, cex=1.25)
+```
+
+## III. Model Development
+
+Now that we have imputed all missing values and Winsorized the data to eliminate extreme values, we can move on to model development. 
+
+### A. Baseline Model
+
+We will first define a baseline model against which potential improvements can be evaluated. The baseline model will be a full-additive model, simply regressing our response, `Three_Year_Spend`, against all predictors, without any transformations or interactions.
+
+```{r}
+set.seed(5)
+train_ind = createDataPartition(df$Three_Year_Spend, p = .75, list = FALSE)
+df_train = df[train_ind, ]
+df_test = df[-train_ind, ]
+
+base_mod = lm(Three_Year_Spend ~ ., data = df_train)
+
+mod_stats = data.frame(loocv = round(get_loocv_rmse(base_mod),2),
+                       RMSE = get_rmse(df_test$Three_Year_Spend - 
+                                       predict(base_mod, newdata = df_test)),
+                       r2 = round(get_r2(df_test$Three_Year_Spend, 
+                                         predict(base_mod, newdata = df_test)),2),
+                       
+                       aic = extractAIC(base_mod)[2],
+                       bp = get_bp_decision(base_mod, alpha = 0.01),
+                       num_params = get_num_params(base_mod))
+
+kable(mod_stats, col.names = c("LOOCV-RMSE", 
+                            "Test RMSE",
+                            "Test R-Squared", 
+                            "AIC",
+                            "BP-Decision", 
+                            "Num Parameters"),
+      caption = "Test Results for Default/Baseline Model",
+      align = c("l","c","c","c","c","c"))
+```
+
+With an Adjusted $R^2$ of `r round(get_adj_r2(base_mod),3)` and an LOOCV-RMSE of `r round(get_loocv_rmse(base_mod),0)`, this model clearly has much room for improvement. 
+
+### B. Variable Selection
+
+#### 1. Transformations
+
+We previously noted that several of the variables have a positively skewed distribution, including the response. Also, a Fitted-vs-Residuals plot clearly demonstrates non-linearity. 
+
+```{r}
+plot(fitted(base_mod), resid(base_mod), 
+     col = "dodgerblue", 
+     pch = 20,
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Baseline Model: Fitted vs. Residuals")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+```
+
+
+```{r}
+lambdas = boxcox(base_mod, plotit = TRUE)
+max_lambda = lambdas$x[[which.max(lambdas$y)]]
+```
+
+Looking at a Box-Cox transformation of the response, we see that the $\lambda$ which maximumizes the log-likelihood is `r round(max_lambda,3)`. 
+
+To determine what other transformation might work, we will also test log, square root, and cubic root transformations, as these are all likely candidates for a positively skewed distribution. Incidentally, we did also experiment with polynomial transformations, up the the sixth degree, but, as we expected, these did not benefit the model.
+
+Before performing these transformations, the data will be split into train (75%) and test (25%) datasets, stratified by our target variable to ensure equal distributions. We will then evaluate the performance of the transformations on the test set.
+
+
+```{r fig.height=10, fig.width=10}
+set.seed(5)
+
+log_spend = log(df$Three_Year_Spend)
+sqrt_spend = sqrt(df$Three_Year_Spend)
+cubic_spend = df$Three_Year_Spend ^ (1/3)
+boxcox_spend = ((df$Three_Year_Spend ^ 0.25) - 1) / 0.25
+
+par(mfrow=c(2,2))
+hist(log_spend, 
+     main = "Log", 
+     xlab = "log(Three_Year_Spend)", 
+     col = "darkorange")
+
+hist(sqrt_spend, 
+     main = "Square Root", 
+     xlab = "sqrt(Three_Year_Spend)", 
+     col = "darkorange")
+
+hist(cubic_spend, 
+     main = "Cubic Root", 
+     xlab = "Three_Year_Spend ^ (1/3)", 
+     col = "darkorange")
+
+hist(boxcox_spend, 
+     main = "Box-Cox, lambda = 0.25", 
+     xlab = "((Three_Year_Spend ^ 0.25) - 1) / 0.25", 
+     col = "darkorange")
+
+train_ind = createDataPartition(df$Three_Year_Spend, p = .75, list = FALSE)
+df_train = df[train_ind, ]
+df_test = df[-train_ind, ]
+
+null_mod = lm(Three_Year_Spend ~ ., data = df_train)
+log_mod = lm(log(Three_Year_Spend) ~ ., data = df_train)
+sqrt_mod = lm(sqrt(Three_Year_Spend) ~ ., data = df_train)
+cubic_mod = lm(I(Three_Year_Spend ^ (1/3)) ~ ., data = df_train)
+boxcox_mod = lm(I(((Three_Year_Spend ^ 0.25) - 1) / 0.25) ~ ., data = df_train)
+
+predictions = data.frame(Actuals = df_test$Three_Year_Spend,
+                         base = predict(null_mod, newdata = df_test),
+                         log = exp(predict(log_mod, newdata = df_test)),
+                         sqrt = predict(sqrt_mod, newdata = df_test) ^ 2,
+                         cubic = predict(cubic_mod, newdata = df_test) ^ 3,
+                         boxcox = na.omit(exp(log(0.25*predict(boxcox_mod, newdata = df_test)+1)/0.25)))
+
+residuals = data.frame(base = predictions$Actuals - predictions$base,
+                       log = predictions$Actuals - predictions$log,
+                       sqrt = predictions$Actuals - predictions$sqrt,
+                       cubic = predictions$Actuals - predictions$cubic,
+                       boxcox = predictions$Actuals - predictions$boxcox)
+
+test_stats = data.frame(Transformation = c("No Transformation", 
+                                           "Log", 
+                                           "Square Root", 
+                                           "Cubic Root", 
+                                           "Box-Cox"),
+                        RMSE = c(get_rmse(residuals$base),
+                                 get_rmse(residuals$log),
+                                 get_rmse(residuals$sqrt),
+                                 get_rmse(residuals$cubic),
+                                 get_rmse(residuals$boxcox)),
+                        R2 = c(get_r2(predictions$Actuals, predictions$base),
+                               get_r2(predictions$Actuals, predictions$log),
+                               get_r2(predictions$Actuals, predictions$sqrt),
+                               get_r2(predictions$Actuals, predictions$cubic),
+                               get_r2(predictions$Actuals, predictions$boxcox)),
+                        Mean = c(mean(residuals$base),
+                                mean(residuals$log),
+                                mean(residuals$sqrt),
+                                mean(residuals$cubic),
+                                mean(residuals$boxcox)),
+                        BP = c(get_bp_decision(null_mod, alpha = 0.01),
+                               get_bp_decision(log_mod, alpha = 0.01),
+                               get_bp_decision(sqrt_mod, alpha = 0.01),
+                               get_bp_decision(cubic_mod, alpha = 0.01),
+                               get_bp_decision(boxcox_mod, alpha = 0.01)))
+
+
+kable(test_stats, 
+      col.names = c("Transformation", "Test RMSE", "Test R-Squared", 
+                    "Mean of Residuals", "Breusch-Pagan Decision"), 
+      caption="Comparison of Response Transformations", 
+      align=c("l","c","c","c","c"))
+```
+
+Interestingly, none of these transformations improves upon the Test RMSE or Test $R^2$ for the baseline model. Also, given that the mean of the residuals for the transformed models is far from zero, the transformations only exacerbate the non-linearity concerns. 
+
+However, perhaps these transformations result in less heteroscedasticity, so we will look at the Fitted-vs.-Residuals plots for each model:
+
+```{r fig.height=10, fig.width=10}
+par(mfrow = c(2,2), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+
+plot(predictions$Actuals, residuals$log, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Log")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+plot(predictions$Actuals, residuals$sqrt, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Square Root")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+plot(predictions$Actuals, residuals$cubic, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Cubic Root")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+plot(predictions$Actuals, residuals$boxcox, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Box-Cox")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+mtext("Fitted-vs-Residuals plots for Transformations of the Response", outer = TRUE, cex=1.25)
+```
+
+
+The log transformation produces some extremely large negative residuals, so it is hard to see the trend in the plot, due to the scale of the y-axis. If we zoom in, we see that the log transformation suffers from the same skew as the other transformations, but produces larger errors. 
+
+```{r}
+plot(predictions$Actuals, residuals$log, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Log", 
+     ylim=c(-8000,8000))
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+```
+
+
+So it does not appear that transformations of the response will be helpful for the model. All models exhibit non-linearity and non-constant variance, but the models using transformations produce errors of a greater magnitude. 
+
+Given that both the predictors and the response follow positive skewed distributions, we will test the transformation of only our positive-skewed numeric predictors using our best-performing transformation (square root).
+
+The distributions of our numeric predictors are as follows:
+
+```{r fig.height=10, fig.width=10}
+df_numeric = df[ , c("Distance",
+                     "Num_Children", 
+                     "Num_Adults", 
+                     "Est_Income", 
+                     "Length_of_Residence", 
+                     "Age", 
+                     "Total_Spend",
+                     "Num_Trans",
+                     "Num_Items",
+                     "Num_Depts",
+                     "Division_Ag_Spend", 
+                     "Division_Pet_Spend", 
+                     "Division_Auto_Spend", 
+                     "Division_Hardware_Spend", 
+                     "Division_Home_Spend", 
+                     "Division_Seasonal_Spend", 
+                     "Division_Clothing_Spend", 
+                     "Division_SportingGoods_Spend", 
+                     "Division_FoodBev_Spend")]
+
+hist.data.frame(df_numeric, mtitl = "Distributions of Numeric Predictors")
+```
+
+
+Apart from Age, these all have very non-normal looking positive-skewed distributions, so we will apply the `sqrt` transformation on each of these predictors.
+
+```{r}
+sqrt_mod = lm(Three_Year_Spend ~ Loyalty_Cust + sqrt(Distance) + 
+              Male + Age + Married + sqrt(Length_of_Residence) + 
+              Homeowner + sqrt(Num_Adults) + sqrt(Num_Children) +
+              sqrt(Est_Income) + Political_Ideology + Pet_Owner +
+              Truck_Owner + sqrt(Total_Spend) + sqrt(Num_Trans) + 
+              sqrt(Num_Items) + sqrt(Num_Depts) + 
+              sqrt(Division_Ag_Spend) + sqrt(Division_Pet_Spend) + 
+              sqrt(Division_Auto_Spend) + sqrt(Division_Hardware_Spend) + 
+              sqrt(Division_Home_Spend) + sqrt(Division_Seasonal_Spend) +
+              sqrt(Division_Clothing_Spend) + sqrt(Division_SportingGoods_Spend) + 
+              sqrt(Division_FoodBev_Spend) + Seg_Group_A + Seg_Group_B + 
+              Seg_Group_C + Seg_Group_D + Seg_Group_E + Seg_Group_G + 
+              Occupation_Retired + Occupation_Sales + Occupation_Professional +
+              Occupation_Management + Occupation_BlueCollar + 
+              Occupation_OfficeAdmin + Occupation_Technical + 
+              Occupation_SelfEmployed + Occupation_Farmer + Education_HS + 
+              Education_SomeCollege + Education_College  + Education_Graduate, 
+              data = df_train)  
+
+actuals = df_test$Three_Year_Spend
+predictions = predict(sqrt_mod, newdata = df_test)
+residuals = actuals - predictions
+
+plot(predictions, residuals, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Square Root Transformation on Numeric Predictors")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+predictions = data.frame(Actuals = df_test$Three_Year_Spend,
+                         base = predict(null_mod, newdata = df_test),
+                         sqrt = predict(sqrt_mod, newdata = df_test))
+
+residuals = data.frame(base = predictions$Actuals - predictions$base,
+                       sqrt = predictions$Actuals - predictions$sqrt)
+
+test_stats = data.frame(Transformation = c("No Transformation", 
+                                           "sqrt on Predictors"),
+                        loocv = c(get_loocv_rmse(base_mod),
+                                 get_loocv_rmse(sqrt_mod)),
+                        RMSE = c(get_rmse(residuals$base),
+                                 get_rmse(residuals$sqrt)),
+                        R2 = c(get_r2(predictions$Actuals, predictions$base),
+                               get_r2(predictions$Actuals, predictions$sqrt)),
+                        Mean = c(mean(residuals$base),
+                                mean(residuals$sqrt)),
+                        BP = c(get_bp_decision(null_mod, alpha = 0.01),
+                               get_bp_decision(sqrt_mod, alpha = 0.01)))
+
+kable(test_stats, 
+      col.names = c("Transformation", "LOOCV-RMSE", "Test RMSE", 
+                    "Test R-Squared", "Mean of Residuals", "Breusch-Pagan Decision"), 
+      caption="Comparison of Response Transformations", 
+      align=c("l","c","c","c","c"))
+```
+
+
+This results in slightly better RMSE and $R^2$ values. Unfortunately, it does not seem to have an impact on the linearity or non-constant variance of the residuals. The transformations will make the coefficients of the model more difficult to interpret, but as our objective is to maximize prediction, this is a trade-off we are forced to make.
+
+Finally, let's investigate the effect of transforming *both* the predictors and the response using `sqrt`:
+
+```{r}
+sqrt_mod_both = lm(sqrt(Three_Year_Spend) ~ Loyalty_Cust + 
+                  sqrt(Distance) + Male + Age + Married + 
+                  sqrt(Length_of_Residence) + Homeowner + 
+                  sqrt(Num_Adults) + sqrt(Num_Children) + 
+                  sqrt(Est_Income) + Political_Ideology + 
+                  Pet_Owner + Truck_Owner + sqrt(Total_Spend) + 
+                  sqrt(Num_Trans) + sqrt(Num_Items) + 
+                  sqrt(Num_Depts) + sqrt(Division_Ag_Spend) + 
+                  sqrt(Division_Pet_Spend) + sqrt(Division_Auto_Spend) + 
+                  sqrt(Division_Hardware_Spend) + sqrt(Division_Home_Spend) + 
+                  sqrt(Division_Seasonal_Spend) + sqrt(Division_Clothing_Spend) +
+                  sqrt(Division_SportingGoods_Spend) + sqrt(Division_FoodBev_Spend) + 
+                  Seg_Group_A + Seg_Group_B + Seg_Group_C + Seg_Group_D + 
+                  Seg_Group_E + Seg_Group_G + Occupation_Retired + Occupation_Sales + 
+                  Occupation_Professional + Occupation_Management + 
+                  Occupation_BlueCollar + Occupation_OfficeAdmin + 
+                  Occupation_Technical + Occupation_SelfEmployed + 
+                  Occupation_Farmer + Education_HS + Education_SomeCollege + 
+                  Education_College + Education_Graduate, 
+                  data = df_train)       
+
+actuals = df_test$Three_Year_Spend
+predictions = predict(sqrt_mod_both, newdata = df_test) ^ 2
+residuals = actuals - predictions
+
+plot(predictions, residuals, 
+     col = "dodgerblue",
+     pch = 20, 
+     cex = 1.5, 
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = "Square Root Transformation on Response and Predictors")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+predictions = data.frame(Actuals = df_test$Three_Year_Spend,
+                         sqrt = predict(sqrt_mod, newdata = df_test),
+                         sqrt_both = predict(sqrt_mod_both, newdata = df_test))
+
+residuals = data.frame(sqrt = predictions$Actuals - predictions$sqrt,
+                       sqrt_both = predictions$Actuals - predictions$sqrt_both)
+
+test_stats = data.frame(Transformation = c("sqrt on Predictors", 
+                                           "sqrt on Response & Predictors"),
+                        RMSE = c(get_rmse(residuals$sqrt),
+                                 get_rmse(residuals$sqrt_both)),
+                        R2 = c(get_r2(predictions$Actuals, predictions$sqrt),
+                               get_r2(predictions$Actuals, predictions$sqrt_both)),
+                        Mean = c(mean(residuals$sqrt),
+                                 mean(residuals$sqrt_both)),
+                        BP = c(get_bp_decision(sqrt_mod, alpha = 0.01),
+                               get_bp_decision(sqrt_mod_both, alpha = 0.01)))
+
+kable(test_stats, col.names = c("Transformation", "Test RMSE", "Test R-Squared", 
+                                "Mean of Residuals", "Breusch-Pagan Decision"), 
+      caption="Comparison of sqrt transformation on Predictors vs Response & Predictors", 
+      align=c("l","c","c","c","c"))
+```
+
+
+Transforming both the predictors and response results in a much higher Test RMSE, and no improvement to the Test $R^2$, so we will not consider this option.
+
+So we determined that performing a square root transformation on our numeric predictors provides the most predictive value. We will therefore set our "baseline model" to be the square root transformation model, and evaluate additional modifications on the basis of this new model. 
+
+```{r}
+base_mod = sqrt_mod
+```
+
+
+#### 2. Collinearity
+
+We previously noted that the individual components of `Total_Spend` were highly correlated with each other. This is what we would expect, considering that `Total_Spend` is essentially the sum of the `Division_Spend_` predictors (plus some very small miscellaneous purchases). If we compute the variance inflation factor for each predictor in our baseline model, we see that only `Total_Spend`, `Num_Depts`, `Seg_Group_A`, and `Seg_Group_B` have relatively high VIFs. `Total_Spend` and `Num_Depts` make sense, as they are related to and correlated with the spend predictors.
+
+```{r}
+vifs = vif(base_mod)
+vifs = vifs[order(-vifs)]
+vifs = data.frame(Predictor = names(vifs), VIF = as.vector(vifs))
+kable(head(vifs,10), caption = "Top 10 Predictors with the Highest VIFs")
+```
+
+Let's determine whether we can remove the collinear predictors without reducing the predictive value of the model.
+
+```{r}
+null_mod = lm(Three_Year_Spend ~ . -sqrt(Total_Spend)
+                                   -sqrt(Num_Depts)
+                                   -Seg_Group_A
+                                   -Seg_Group_B, data = df_train)
+
+model_comparison = data.frame(Model = c("Full Model", 
+                                        "Model without Divisional Spend"),
+                              loocv = c(get_loocv_rmse(base_mod), 
+                                        get_loocv_rmse(null_mod)),
+                              RMSE = c(get_rmse(df_test$Three_Year_Spend - 
+                                                  predict(base_mod, newdata = df_test)),
+                                       get_rmse(df_test$Three_Year_Spend -
+                                                  predict(null_mod, newdata = df_test))),
+                              R2 = c(get_r2(df_test$Three_Year_Spend, predict(base_mod, newdata = df_test)),
+                                     get_r2(df_test$Three_Year_Spend, predict(null_mod, newdata = df_test))),
+                              Parameters = c(get_num_params(base_mod), 
+                                             get_num_params(null_mod)),
+                              BP = c(get_bp_decision(base_mod, 0.01), 
+                                     get_bp_decision(null_mod, 0.01)))
+
+kable(model_comparison, col.names = c("Model", 
+                                      "LOOCV-RMSE", 
+                                      "Test RMSE", 
+                                      "Test R-Squared", 
+                                      "Num Parameters", 
+                                      "B-P Decision"), 
+      caption = "Full Model vs. Model without Collinear Predictors", 
+      align=c("l","c","c","c","c"))
+
+
+anova_p_val = anova(null_mod, base_mod)[2, "Pr(>F)"]
+```
+
+
+Our ANOVA test results in a p-value of `r format(anova_p_val, scientific = TRUE, big.mark = ",")`, confirming that the collinear predictors *do* have a significant effect upon the model. Including these predictors results in a lower RMSE and a higher Test $R^2$. So we will retain these predictors in the model.
+
+#### 3. Remove Insignificant Predictors
+
+Before we determine which interactions to include in the model, we will first identify which first-order predictors we can eliminate. Given that the number of interactions increases at a non-linear rate, we want to evaluate the influence of interactions only on predictors that are likely to be significant. A backwards AIC regression can be used to determine which first-order predictors may be superfluous. 
+
+```{r}
+backwards_mod = step(base_mod, trace = FALSE)
+
+model_comparison = data.frame(
+                    Model = c("Full Model", "Backwards AIC Model"),
+                    RMSE = c(get_loocv_rmse(base_mod), get_loocv_rmse(backwards_mod)),
+                    R2 = c(get_adj_r2(base_mod), get_adj_r2(backwards_mod)),
+                    AIC = c(extractAIC(base_mod)[2], extractAIC(backwards_mod)[2]),
+                    Parameters = c(get_num_params(base_mod), get_num_params(backwards_mod)),
+                    BP = c(get_bp_decision(base_mod, 0.01), get_bp_decision(backwards_mod, 0.01)))
+
+kable(model_comparison, col.names = c("Model", 
+                                      "LOOCV-RMSE", 
+                                      "Adj. R-Squared", 
+                                      "AIC", 
+                                      "Num Parameters", 
+                                      "B-P Decision"), 
+      caption = "Full Model vs. Backwards AIC Model",
+      align=c("l","c","c","c","c","c"))
+
+anova_p_val = anova(backwards_mod, base_mod)[2, "Pr(>F)"]
+```
+
+
+The backwards AIC regression eliminates 15 parameters from the model with essentially no increase in LOOCV-RMSE or decrease in $R^2$. An ANOVA test (p-value = `r round(anova_p_val,3)`) confirms that these additional 15 parameters are not significant and should be removed. We will therefore set the baseline model to the backwards AIC model. 
+
+```{r}
+base_mod = backwards_mod
+```
+
+
+#### 3. Interactions
+
+We will now investigate whether any interactions between the remaining predictors should be included in the model, and whether any of these interactions are more significant than any of the existing first-order predictors. For instance, one could imagine that the interaction between `Num_Trans` and `Distance` may be more important to the model than the impact of a first-order predictor such as `Occupation_SelfEmployed`. So we will perform a stepwise BIC, using our backwards AIC model as the starting point, and add or subtract both first-order terms and two-way interactions. We are using BIC rather than AIC in this context because there are a very large number of interactions to be considered and we want to limit our model to only the most significant ones.
+
+
+```{r}
+# create formula for scope parameter: All parameters in baseline model, plus all two-way interactions
+base_mod_predictors = names(coef(base_mod))[-1]
+formula = ""
+for (i in 1:length(base_mod_predictors)) {
+  formula = paste(formula, base_mod_predictors[i], sep = "", collapse = "")
+  
+  if (i < length(base_mod_predictors)) {
+    formula = paste(formula, " + ", sep = "", collapse = "")
+  }
+}
+formula = paste("Three_Year_Spend ~ (", formula, ") ^ 2", sep = "", collapse = "")
+
+# perform a stepwise BIC regression 
+step_mod = step(base_mod, 
+                scope = formula, 
+                direction = "both",
+                trace = FALSE, K = log(nrow(df)))
+
+model_comparison = data.frame(Model = c("Backwards AIC Model", 
+                                        "Stepwise BIC Interactive Model"),
+                              loocv = c(get_loocv_rmse(base_mod), 
+                                        get_loocv_rmse(step_mod)),
+                              RMSE = c(get_rmse(df_test$Three_Year_Spend -
+                                                predict(base_mod, newdata = df_test)), 
+                                       get_rmse(df_test$Three_Year_Spend - 
+                                                predict(step_mod, newdata = df_test))),
+                              R2 = c(get_r2(df_test$Three_Year_Spend, 
+                                            predict(base_mod, newdata = df_test)), 
+                                     get_r2(df_test$Three_Year_Spend, 
+                                            predict(step_mod, newdata = df_test))),
+                              Parameters = c(get_num_params(base_mod), 
+                                             get_num_params(step_mod)),
+                              BP = c(get_bp_decision(base_mod, 0.01), 
+                                     get_bp_decision(step_mod, 0.01)))
+
+kable(model_comparison, col.names = c("Model", 
+                                      "LOOCV-RMSE", 
+                                      "Test RMSE", 
+                                      "Test R-Squared", 
+                                      "Num Parameters", 
+                                      "B-P Decision"), 
+      caption = "Backwards AIC Model vs. Stepwise BIC Interactive Model",
+      align=c("l","c","c","c","c","c"))
+
+anova_p_val = anova(base_mod, step_mod)[2, "Pr(>F)"]
+```
+
+The stepwise BIC search results in `r get_num_params(step_mod) - get_num_params(backwards_mod)` additional parameters, but there is a non-negligible decrease in RMSE and increase in $R^2$. An ANOVA test (p-value = `r format(anova_p_val, scientific = TRUE, big.mark = ",")`) indicates that the interactive model *does* provide a statistically significant improvement over the model that lacks the interactions. 
+
+So, although we would prefer to create a parsimonious model, our principal objective is to maximize predictivity. So we will retain the interactions in our model. This seems like a poor trade-off, but given the already very low predictivity of the model, at this point we need to retain even marginal improvements to RMSE and $R^2$.
+
+```{r}
+base_mod = step_mod
+```
+
+
+## III. Model Diagnostics
+
+### A. Influential Observations
+
+It is possible that a few anomalous observations are influencing the regression results and contributing to the relatively poor fit. 
+
+```{r}
+influentials = df_train[cooks.distance(base_mod) > (4 / length(cooks.distance(base_mod))), "Three_Year_Spend"]
+```
+
+
+Calculating Cook's Distance on the current interactive model, we find that there are `r length(influentials)` influential observations in our dataset, or `r round((length(influentials)/nrow(df))*100,1)`% of all observations. If we overlay these influential points on a Fitted vs. Observed plot, we see that these influential points tend to have large residuals, lying far from the regression line. Also, many of the observations are clustered around the maximum value of `Three_Year_Spend`. 
+
+```{r}
+fitted_vals = fitted(base_mod)
+residual_vals = resid(base_mod)
+fitted_influentials = fitted_vals[cooks.distance(base_mod) > 
+                                    (4 / length(cooks.distance(base_mod)))]
+
+plot(x = fitted(base_mod), y = df_train$Three_Year_Spend, 
+     xlab = "Fitted",  
+     ylab = "Observed",
+     col = "dodgerblue", 
+     main = "Fitted vs. Observed, with Influentials",
+    pch = 20)
+abline(0, 1, col = 'darkorange', lwd=2)
+points(x = fitted_influentials, y = influentials, col = "darkorange")
+legend("bottomright", 
+       legend = c("Influential Observations"), 
+       col = c("darkorange"), 
+       pch = 21, 
+       cex = 0.75)
+
+```
+
+
+If we compare the means of the influential observations to those of all observations, the only thing that really stands out is that the influentials are more likely to be high-spending customers, both in the initial one-month opening period and after three years. All other predictors seem very similar between the two sets of observations. So there does not seem to be anything particularly "unusual" about these observations, and certainly no justification for removing them from the dataset. 
+
+```{r}
+df_influentials = df_train[cooks.distance(base_mod) > 
+                             (4 / length(cooks.distance(base_mod))), ]
+mean_comparison = data.frame(Cols = names(colMeans(df_influentials)), 
+                             InfluentialMeans = as.vector(colMeans(df_influentials)), 
+                             AllMeans = as.vector(colMeans(df_train)))
+
+kable(mean_comparison, col.names = c("Parameters", 
+                                     "Mean of Influentials", 
+                                     "Mean of All Records"), 
+      caption = "Comparison of Influentials to All Observations")
+```
+
+### B. Model Assumptions
+
+Although the focus of our model is on prediction, rather than on understanding the influence of the predictors, we nevertheless would like to understand whether the assumptions of our regression are valid. If they are not, we would like to understand why they are violated. 
+
+We will reference the following plots in the subsequent discussion:
+
+```{r fig.height=5, fig.width=12}
+par(mfrow = c(1,3), mar=c(5,5,3,0), oma = c(0, 0, 3, 0)) 
+
+plot(fitted_vals, residual_vals, 
+     col = "dodgerblue", 
+     pch = 20,
+     xlab = "Fitted", ylab = "Residuals", 
+     main = "Fitted vs. Residuals")
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+
+hist(residual_vals,
+     xlab   = "Residuals",
+     main   = "Histogram of Residuals",
+     col    = "darkorange",
+     border = "dodgerblue",
+     breaks = 20)
+
+qqnorm(residual_vals, main = "Normal Q-Q Plot", col = "darkgrey")
+qqline(residual_vals, col = "dodgerblue", lwd = 2)
+
+mtext("Interactive Stepwise BIC Model", outer = TRUE, cex=1.25) 
+```
+
+
+#### 1. Linearity
+
+There are two problems with the model which result in the non-linearity we see in the Fitted vs. Residuals plot. 
+
+The non-linearity is partially a consequence of the non-normal positive skew of the data. If the fitted value is less than or equal to zero, then the residual is necessarily zero-to-positive, because the observation will always be above zero. Similarly, if the fitted value is $5,500 or greater, the residual will always be zero-to-negative, because the observations take the range zero to $5,500. So there are necessarily going to be upper and lower diagonal borders on the Fitted-vs.-Residuals plot, highlighted in orange below:
+
+```{r}
+plot(fitted_vals, residual_vals, col = "dodgerblue", pch = 20,
+     xlab = "Fitted", ylab = "Residuals", main = "Fitted vs. Residuals")
+
+lines(x = c(0, 8000 ), 
+      y = c(5500, -2500), lwd=3, col="darkorange")
+
+lines(x = c(-2000, 4500 ), 
+      y = c(2000, -4500), lwd=3, col="darkorange")
+
+```
+
+
+This can also be demonstrated with a simulation. We will create a new predictor that is a function of the response and a large degree of noise. If we fit a model using this predictor, we see a plot that looks similar to our actual Fitted vs. Residuals plot, except that the simulated model is not making any negative predictions. 
+
+```{r}
+df_sim = data.frame(df)
+df_sim$TestPredictor = df_sim$Three_Year_Spend + rnorm(nrow(df_sim), mean = 0, sd = 1000)
+df_sim$TestPredictor = ifelse(df_sim$TestPredictor < 0, 0, df_sim$TestPredictor)
+
+mod = lm(Three_Year_Spend ~ TestPredictor, data = df_sim)
+
+plot(fitted(mod), resid(mod), 
+     col = "dodgerblue", 
+     pch = 20,
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = bquote("Fitted vs. Residuals for Simulated Predictor, " ~ sigma ~ " = 1,000"))
+abline(h = 0, lty = 2, col = "darkorange", lwd = 2)
+```
+
+
+However, the other cause of this non-linearity is that the signal in the data is quite weak. If there is not a sufficiently strong signal in the data for the regression to identify, then it will essentially be "guessing" at every observation. Therefore, observations on the low-end of the range will typically be over-estimated (as they are less than the mean observation) and observations on the high-end of the range will typically be under-estimated (as they are above the mean). This is what is happening here. Our best predictor, `Num_Trans` only has a `r round(cor(df$Three_Year_Spend, df$Num_Trans),3)` correlation with `Three_Year_Spend`. If we run the same simulation that we just ran above, but amplify the signal (i.e. reduce the amount of noise), we see that the Fitted vs. Residuals plot is much more linear:
+
+```{r}
+df_sim = data.frame(df)
+df_sim$TestPredictor = df_sim$Three_Year_Spend + rnorm(nrow(df_sim), mean = 0, sd = 100)
+df_sim$TestPredictor = ifelse(df_sim$TestPredictor < 0, 0, df_sim$TestPredictor)
+
+mod = lm(Three_Year_Spend ~ TestPredictor, data = df_sim)
+
+plot(fitted(mod), resid(mod), 
+     col = "dodgerblue", 
+     pch = 20,
+     xlab = "Fitted", 
+     ylab = "Residuals", 
+     main = bquote("Fitted vs. Residuals for Simulated Predictor, " ~ sigma ~ " = 100"))
+abline(h = 0, col = "darkorange", lwd = 2)
+```
+
+#### 2. Normality
+
+The Normal Q-Q plot and the histogram of residuals both clearly indicate that the errors are not normally distributed. The model is under-estimating the response (and therefore creating large positive residuals) more frequently than expected if the errors were drawn from a normal distribution. This again is obviously a consequence of working with a strongly skewed distribution. So we see a very fat right-hand tail both in the histogram and in the Q-Q plot. We don't need to run a Shapiro-Wilk test, but just for reference, the p-value of the test from a random sample of 5,000 observations is practically zero, confirming our observation of non-normality.
+
+```{r}
+set.seed(5)
+shapiro.test(residual_vals[sample(length(residual_vals), 5000)])
+```
+
+#### 3. Constant-Variance
+
+It is not particularly obvious from the Fitted vs. Residuals plot that the constant-variance assumption is violated, but a Breusch-Pagan test results in a very small p-value, indicating that there *is* heteroscedasticity. All of these findings make it clear that we will not be able to make any inferences about the coefficients of the model. All the assumptions of linear regression are violated -- linearity, normality, and constant-variance.
+
+```{r}
+paste("B-P Test p-value:", format(bptest(base_mod)$p.value, scientific = TRUE, big.mark = ","), collapse = "")
+```
+
+# Results
+
+```{r include=FALSE}
+fitted = predict(base_mod, newdata = df_test)
+actuals = df_test$Three_Year_Spend
+residuals = actuals - fitted
+
+rmse = get_rmse(residuals)
+r2 = get_r2(actuals, fitted)
+loocv = get_loocv_rmse(base_mod)
+sdev = sd(residuals)
+```
+
+Our best fitting model provided a test RMSE of `r round(rmse,0)`, an LOOCV-RMSE of `r round(loocv,0)` on the training data, and a test $R^2$ of `r round(r2,3)`. In other words, on average the model over or under estimated the three-year spend of customers by $`r format(round(rmse,0), scientific = FALSE, big.mark = ",")`, given a range of actuals from $0 to $5,500.
+
+```{r}
+kable(data.frame(LOOCV = loocv,
+                 RMSE = rmse,
+                 R2 = r2,
+                 sdev = sdev),
+      col.names = c("Train LOOCV-RMSE", "Test RMSE", "Test R-Squared", "Residual Std Dev"),
+      caption = "Final Model Statistics")
+```
+
+Unfortunately, the signal in the data is very weak. This is also apparent from the large degree of spread around the regression line that we see in the Fitted vs. Observed plot, and the wide range of error we see in a histogram of the residuals. Also, as previously noted, we can see that the variance of residuals is not constant -- the model under-estimates customer value far more often than it over-estimates customer value (resulting in more positive residuals, and the right-skewed tail in the residuals histogram).
+
+```{r fig.height=5, fig.width=10}
+par(mfrow = c(1,2)) 
+plot(fitted, actuals, 
+     col="dodgerblue", 
+     pch=20, 
+     main = "Fitted vs. Observed",
+     xlab="Fitted", 
+     ylab="Observed")
+abline(0 , 1, col = "darkorange", lwd = 2)
+
+hist(residuals, 
+     breaks=20, 
+     col="darkorange", 
+     main = "Histogram of Residuals",
+     ylab="Residuals")
+abline(v = mean(residuals)-sdev, col="dodgerblue", lwd=2)
+abline(v = mean(residuals)+sdev, col="dodgerblue", lwd=2)
+legend("topright", legend="Std Dev = 1", col="dodgerblue", lwd=2, cex=0.75)
+```
+
+```{r}
+spend_threshold = min(head(df_test[order(-df_test$Three_Year_Spend), "Three_Year_Spend"], 0.25*nrow(df_test)))
+```
+
+Given the model's relatively low measures of predictive value, we need to address the question of whether the model is useful. One way to approach this question is to imagine a potential use case. For instance, we might like to identify the set of customers whose three-year spend will be in the top 25% of all customers, so that these high-potential customers can be targeted with a direct-mailing campaign. In our test dataset, the top 25% of customers would represent customers whose three-year spend was at least $`r format(round(spend_threshold,0), scientific = FALSE, big.mark = ",")`.
+
+So we can create a classifier on top of the existing model and use it to predict the set of customers who would be expected to spend more than $`r format(round(spend_threshold,0), scientific = FALSE, big.mark = ",")`. Of course, if we just wanted to use the model for classification, we would convert our response to a binary variable, and then use logistic regression to predict that response, but the purpose of the current exercise is just to demonstrate the usefulness of a model with an RMSE as large as the one we have produced.
+
+The confusion matrix for our classification, on our test set, is shown below:
+
+```{r}
+high_spend_actual = ifelse(actuals > spend_threshold, 
+                           "High-Spender", "Non-High-Spender")
+
+high_spend_prediction = ifelse(fitted > spend_threshold, 
+                               "High-Spender", "Non-High-Spender")
+
+conf_matrix = table(Predicted = high_spend_prediction, 
+                    Actual = high_spend_actual)
+
+fourfoldplot(conf_matrix, 
+             conf.level = 0, 
+             margin = 1, 
+             main = "Spend Classifier Confusion Matrix", 
+             color = c("red", "green3"))
+
+accuracy = mean(high_spend_actual == high_spend_prediction)
+misclass_rate = mean(high_spend_actual != high_spend_prediction)
+sensitivity = conf_matrix[1, 1] / sum(conf_matrix[, 1])
+specificity = conf_matrix[2, 2] / sum(conf_matrix[, 2])
+
+majority_class_accuracy = mean(high_spend_actual == "Non-High-Spender") 
+```
+
+
+The accuracy of the test is `r round(accuracy,3)`. So the mis-classfication rate is `r round(misclass_rate,3)`. The sensitivity is `r round(sensitivity,3)` and the specificity is `r round(specificity,3)`.
+
+The low sensitivity of the classifier gives us an indication of the problem here. The specificity and mis-classification rates do not seem particularly poor, until we compare these rates to the results of simply classifying *all observations* as the majority class (i.e. "Non-High-Spenders"). The accuracy of that test is `r round(majority_class_accuracy,3)`, which is essentially equal to the accuracy of the classifier based upon our model. 
+
+So if we created a direct-mailing campaign on the basis of this model, we would correctly target only `r round(sensitivity*100,1)`% of the potential high-spending customers and `r round((1-sensitivity)*100,1)`% of the mailings would be wasted. That is unlikely to be a good return on investment. 
+
+# Discussion
+
+On the basis of the sample use case illustrated above and the low measures of the predictive value of the model, our conclusion is that the model is of limited utility. It suffers from hidden variable bias, which results in a very weak signal in the data. Additional predictors need to be identified, or we need to extend the period of shopping history collected for new customers. For this model we used only a one-month shopping history following the store's opening. The most predictive variables in the model were those that measure the customer's shopping behavior, not their personal attributes. Predictors such as the customer's age, distance from the store, or their segmentation type had a very weak relationship with the response. Adding interactions between these personal attributes and the customer's one-month shopping behavior did not substantially increase the model's predictivity. Transformations of the predictors provided only marginal gains. So, future attempts to predict long-term customer value should collect additional measures of customer *behavior* and look at incremental increases in the length of shopping history used to predict three-year spend. For instance, perhaps three-months of history would be substantially more predictive than one month. 
+
+In addition to utilizing a modified dataset, we plan to also experiment with different modeling approaches. Given the non-normal distribution of the response, and our inability to normalize it through the use of transformations, a generalized linear model based upon a Gamma distribution may be more applicable to this dataset. Future iterations could also incorporate a tree-based approach (Random Forest, XGBoost, Cubist, etc.). This would help account for the skewness of the fields as well as handling some of the data points that could be considered outliers. A tree-based approach could potentially find better data splits, resulting in a model with a lower RMSE. Further research will investigate these questions.
+
+# Appendix
+
+This report was completed by Team RK_SN, Ryan Klein (ryank8) and Shaun Niemeyer (shaunan2).
+
